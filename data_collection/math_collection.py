@@ -36,9 +36,9 @@
 #     """Collect task, task_id, plan, hidden_state, task_type, and task_level into a global list"""
 #     # hidden_state is expected to be [T, H] or [1, T, H]; normalize to [T, H]
 #     if hidden_state.dim() == 3 and hidden_state.size(0) == 1:
-#         hidden_np = hidden_state.cpu().numpy().squeeze(0).astype(np.float32)  # [T, H]
+#         hidden_np = hidden_state.to(torch.float32).cpu().numpy().squeeze(0).astype(np.float32)  # [T, H]
 #     else:
-#         hidden_np = hidden_state.cpu().numpy().astype(np.float32)             # [T, H]
+#         hidden_np = hidden_state.to(torch.float32).cpu().numpy().astype(np.float32)             # [T, H]
 
 #     entry = {
 #         "task": task,
@@ -573,6 +573,7 @@ import socket
 import datetime
 import math
 from pathlib import Path
+import gc
 
 # Global variable to collect all data
 all_data = []
@@ -581,9 +582,9 @@ def save_train_data(task, task_id, plan, hidden_state, task_type, task_level):
     """Collect task, task_id, plan, hidden_state, task_type, and task_level into a global list"""
     # hidden_state is expected to be [T, H] or [1, T, H]; normalize to [T, H]
     if hidden_state.dim() == 3 and hidden_state.size(0) == 1:
-        hidden_np = hidden_state.cpu().numpy().squeeze(0).astype(np.float32)  # [T, H]
+        hidden_np = hidden_state.to(torch.float32).cpu().numpy().squeeze(0).astype(np.float32)  # [T, H]
     else:
-        hidden_np = hidden_state.cpu().numpy().astype(np.float32)             # [T, H]
+        hidden_np = hidden_state.to(torch.float32).cpu().numpy().astype(np.float32)             # [T, H]
 
     entry = {
         "task": task,
@@ -745,46 +746,40 @@ def save_rank_data(rank, all_data, temp_dir="temp_rank_data"):
     print(f"Rank {rank} saved data to {filename}")
 
 def finalize_data_save_and_merge(rank, world_size, output_dir="final_output", temp_dir="temp_rank_data", args=None):
-    """Each process saves its own data; the main process merges them"""
-    if world_size <= 1:
-        convert_to_hf_dataset(
-            all_data,
-            output_dir,
-            parquet_max_gb=args.parquet_max_gb if args else 2.0,
-            write_full=args.write_full if args else True,
-            write_shards=args.write_shards if args else True
-        )
+    """Modified to load incremental chunks safely into Parquet shards directly."""
+    import glob
+    
+    chunk_dir = os.path.join(output_dir, "safe_chunks")
+    all_chunks = glob.glob(os.path.join(chunk_dir, "*.pkl"))
+    
+    if not all_chunks:
+        print("No chunks found. Nothing to save.")
         return
 
-    save_rank_data(rank, all_data, temp_dir=temp_dir)
-    dist.barrier()
+    print(f"Found {len(all_chunks)} safe chunks. Converting directly to Parquet shards...")
+    
+    shards_dir = os.path.join(output_dir, "parquet_shards")
+    os.makedirs(shards_dir, exist_ok=True)
+    
+    # Process one chunk at a time to keep RAM usage extremely low
+    for i, chunk_file in enumerate(all_chunks):
+        try:
+            with open(chunk_file, "rb") as f:
+                chunk_data = pickle.load(f)
+            
+            # Write directly to parquet using your existing helper function
+            out_path = os.path.join(shards_dir, f"data_shard_{i:05d}.parquet")
+            _write_parquet_shard(chunk_data, out_path)
+            print(f"✅ Converted {os.path.basename(chunk_file)} -> {os.path.basename(out_path)}")
+            
+            # Free memory immediately
+            del chunk_data
+            gc.collect()
+        except Exception as e:
+            print(f"Error processing {chunk_file}: {e}")
 
-    if rank == 0:
-        print("Start merging data from all ranks...")
-        full_data = []
-
-        for i in range(world_size):
-            filename = os.path.join(temp_dir, f"rank_{i}.pkl")
-            if not os.path.exists(filename):
-                print(f"Warning: missing file {filename}, skipping rank {i}")
-                continue
-            with open(filename, "rb") as f:
-                rank_data = pickle.load(f)
-                full_data.extend(rank_data)
-
-        convert_to_hf_dataset(
-            full_data,
-            output_dir,
-            parquet_max_gb=args.parquet_max_gb if args else 2.0,
-            write_full=args.write_full if args else True,
-            write_shards=args.write_shards if args else True
-        )
-
-        import shutil
-        shutil.rmtree(temp_dir)
-        print(f"✅ Temporary directory removed: {temp_dir}")
-    else:
-        print(f"Rank {rank} finished saving data.")
+    print(f"\n🎉 All data safely stored in {shards_dir}!")
+    print("Note: Bypassed HFDataset.from_dict() to prevent RAM crashes.")
 
 
 def setup_distributed(args):
@@ -872,14 +867,22 @@ def load_model(model_path, rank, torch_dtype="float32"):
     return model, tokenizer
 
 
-def agent_generate(model, tokenizer, text, device, args):
-    text = '<|im_start|>user\n' + text + '<|im_end|>\n<|im_start|>assistant\n'
-    inputs = tokenizer(text, return_tensors="pt").to(device)
+def agent_generate(model, tokenizer, texts, device, args):
+    """Modified to handle a list of texts (batch)"""
+    # Apply chat template to each text in the batch
+    formatted_texts = [
+        '<|im_start|>user\n' + t + '<|im_end|>\n<|im_start|>assistant\n'
+        for t in texts
+    ]
+    
+    # Tokenize with padding
+    tokenizer.padding_side = 'left' # Important for batched generation
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    inputs = tokenizer(formatted_texts, return_tensors="pt", padding=True).to(device)
+    
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
-
     input_length = input_ids.shape[1]
-    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
     outputs = model.generate(
         input_ids=input_ids,
@@ -897,31 +900,33 @@ def agent_generate(model, tokenizer, text, device, args):
         output_hidden_states=True
     )
 
-    generated_text = tokenizer.decode(
-        outputs.sequences[0][input_length:], skip_special_tokens=True
+    # Decode all generated texts
+    generated_texts = tokenizer.batch_decode(
+        outputs.sequences[:, input_length:], skip_special_tokens=True
     )
 
+    # Extract hidden states for the generated tokens
     step_hiddens = []
     steps = outputs.hidden_states
     start_index = max(0, len(steps) - args.max_hidden_states)
+    
     for i in range(start_index, len(steps)):
-        last_layer = steps[i][-1]
-        h_last = last_layer[:, -1, :]
+        # Extract the specific layer requested (default is -1, the last layer)
+        target_layer = steps[i][args.layer_index] 
+        h_last = target_layer[:, -1, :] # Take the last token's hidden state
         step_hiddens.append(h_last)
 
+
+    # Stack along time dimension: [batch_size, num_generated_tokens, hidden_dim]
     hidden_seq = torch.stack(step_hiddens, dim=1)
 
-    if hidden_seq.size(0) == 1:
-        hidden_seq = hidden_seq.squeeze(0)
-
-    return generated_text, hidden_seq
+    return generated_texts, hidden_seq
 
 
-def infer_chain(model, tokenizer, task, task_solution, task_id, task_type, task_level, device, args):
-    """Execute a reasoning chain and save the sample (including task_type / task_level)"""
+def infer_chain(model, tokenizer, tasks, task_solutions, task_ids, task_types, task_levels, device, args):
+    """Modified to process batched arrays"""
     from textwrap import dedent
 
-    # Use custom prompt if provided, otherwise use default
     if args.custom_prompt:
         prompt_template = args.custom_prompt
     else:
@@ -941,61 +946,97 @@ def infer_chain(model, tokenizer, task, task_solution, task_id, task_type, task_
         {question}
         """.strip()
 
-    def build_plan_prompt(question: str) -> str:
-        return dedent(prompt_template).format(question=question).strip()
+    # Build prompts for the whole batch
+    prompts = [dedent(prompt_template).format(question=t).strip() for t in tasks]
+    
+    # Generate batched outputs
+    generated_texts, hidden_seqs = agent_generate(model, tokenizer, prompts, device, args)
 
-    prompt = build_plan_prompt(task)
-    generated_text, hidden_seq = agent_generate(model, tokenizer, prompt, device, args)
-    plan = generated_text
+    # Save each item in the batch individually
+    batch_size = len(tasks)
+    for i in range(batch_size):
+        if args.verbose:
+            print(f"Agent output for {task_ids[i]}: {generated_texts[i][:100]}...")
 
-    if args.verbose:
-        print(f"Agent 1 output: {generated_text}")
+        save_train_data(
+            task=tasks[i],
+            task_id=task_ids[i],
+            plan=generated_texts[i],
+            hidden_state=hidden_seqs[i], # [T, H] slice for this specific item
+            task_type=task_types[i],
+            task_level=task_levels[i],
+        )
 
-    save_train_data(
-        task=task,
-        task_id=task_id,
-        plan=plan,
-        hidden_state=hidden_seq,
-        task_type=task_type,
-        task_level=task_level,
-    )
-
-    return hidden_seq
+    return hidden_seqs
 
 
 def evaluate(model, tokenizer, dataloader, device, rank, world_size, args, base_offset: int):
-    """Evaluate model performance; use base_offset to ensure globally unique task_id"""
+    global all_data
     task_num = 0
     correct_count = 0
+    import glob
+
+    # Create a directory for safe incremental backups
+    chunk_dir = os.path.join(args.output_dir, "safe_chunks")
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    # --- RESUME LOGIC: Find the highest batch index saved ---
+    start_batch_idx = 0
+    existing_chunks = glob.glob(os.path.join(chunk_dir, "chunk_*.pkl"))
+    if existing_chunks:
+        # Extract batch numbers from filenames like "chunk_5.pkl"
+        saved_indices = []
+        for f in existing_chunks:
+            basename = os.path.basename(f)
+            if "final" not in basename:
+                try:
+                    num = int(basename.split('_')[1].split('.pkl')[0])
+                    saved_indices.append(num)
+                except ValueError:
+                    pass
+        if saved_indices:
+            start_batch_idx = max(saved_indices) + 1
+            print(f"\n🔄 Resuming from batch index {start_batch_idx} (found {len(existing_chunks)} saved chunks).")
 
     pbar = tqdm(total=len(dataloader), desc=f"GPU {rank} processing")
+    
+    # Update progress bar to reflect already completed batches
+    if start_batch_idx > 0:
+        pbar.update(start_batch_idx)
 
     try:
         for batch_idx, task_item in enumerate(dataloader):
-            task_num += 1
-            global_idx = base_offset + batch_idx + 1
-            task = task_item['problem'][0]
-            task_level = task_item['level'][0]
-            task_type = task_item['type'][0]
-            task_id = f'MATH_{global_idx}'
-            task_solution = task_item['solution'][0]
+            # --- RESUME LOGIC: Skip already processed batches ---
+            if batch_idx < start_batch_idx:
+                task_num += len(task_item['problem'])
+                continue
+
+            tasks = task_item['problem']
+            task_levels = task_item['level']
+            task_types = task_item['type']
+            task_solutions = task_item['solution']
+            
+            current_batch_size = len(tasks)
+            task_ids = [f'MATH_{base_offset + task_num + i + 1}' for i in range(current_batch_size)]
+            task_num += current_batch_size
 
             if args.verbose:
-                print(
-                    f"GPU {rank}, batch {batch_idx}/{len(dataloader)}, "
-                    f"global_id={task_id}, processing: {task[:50]}..."
-                )
+                print(f"GPU {rank}, batch {batch_idx}/{len(dataloader)}, processing {current_batch_size} items...")
 
             _ = infer_chain(
-                model, tokenizer,
-                task=task,
-                task_solution=task_solution,
-                task_id=task_id,
-                task_type=task_type,
-                task_level=task_level,
-                device=device,
-                args=args
+                model, tokenizer, tasks, task_solutions, task_ids, 
+                task_types, task_levels, device, args
             )
+
+            # --- INCREMENTAL SAVING TO PREVENT OOM ---
+            # Flush to disk every ~64 items to keep System RAM practically empty
+            if len(all_data) >= 64:  
+                chunk_path = os.path.join(chunk_dir, f"chunk_{batch_idx}.pkl")
+                with open(chunk_path, "wb") as f:
+                    pickle.dump(all_data, f)
+                print(f"\n💾 [Memory Saver] Flushed {len(all_data)} items to disk. Clearing RAM...")
+                all_data.clear()
+                gc.collect()
 
             pbar.update(1)
     except Exception as e:
@@ -1004,6 +1045,15 @@ def evaluate(model, tokenizer, dataloader, device, rank, world_size, args, base_
         traceback.print_exc()
     finally:
         pbar.close()
+
+    # Save any remaining data in the buffer at the very end
+    if len(all_data) > 0:
+        chunk_path = os.path.join(chunk_dir, f"chunk_final.pkl")
+        with open(chunk_path, "wb") as f:
+            pickle.dump(all_data, f)
+        print(f"\n💾 [Memory Saver] Flushed final {len(all_data)} items to disk.")
+        all_data.clear()
+        gc.collect()
 
     return correct_count, task_num
 
@@ -1086,6 +1136,13 @@ def create_argument_parser():
         "--max_hidden_states", type=int, default=10000,
         help="Maximum number of hidden states to collect"
     )
+
+    gen_group.add_argument(
+        "--layer_index", type=int, default=-1,
+        help="The specific hidden layer to extract (-1 for the last layer)"
+    )
+
+
 
     # Prompt customization
     prompt_group = parser.add_argument_group('Prompt Configuration')
