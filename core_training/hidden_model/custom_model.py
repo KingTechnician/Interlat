@@ -549,6 +549,10 @@ class ModelWithInsertedHiddenState(nn.Module):
         random_outputs = None
         negs = self.cross_gpu_negatives(prepended_hidden_states)
         random_hidden_states = negs
+        if random_hidden_states is None:
+            indices = list(range(len(prepended_hidden_states)))
+            random.shuffle(indices)
+            random_hidden_states = [prepended_hidden_states[i] for i in indices]
 
         for i in range(len(random_hidden_states)):
             hidden_state_len = prepended_hidden_states[i].size(0)

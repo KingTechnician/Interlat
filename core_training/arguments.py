@@ -48,6 +48,11 @@ class ModelArguments:
         default=False,
     )
 
+    prepended_input_dim: Optional[int] = field(
+        default=None,
+        metadata={"help": "Input dimension of incoming hidden states (for cross-model, e.g. 3584 for 7B sender)"}
+    )
+
 
 @dataclass
 class DataArguments:

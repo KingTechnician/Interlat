@@ -252,7 +252,7 @@ def train():
             prepended_learnable=model_args.prepended_learnable,
             plan_similarity_weight=model_args.plan_similarity_weight,
             random_contrast_weight=model_args.random_contrast_weight,
-            prepended_input_dim=hidden_size,
+            prepended_input_dim=model_args.prepended_input_dim or hidden_size,
         )
         rank0_print(f"Created model with {model_args.prepended_length} prepended hidden states")
         rank0_print(f"Prepended states learnable: {model_args.prepended_learnable}")
@@ -355,7 +355,7 @@ def train():
     # Start trainer
     trainer = Trainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         args=training_args,
         **data_module,
         callbacks=[

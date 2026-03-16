@@ -248,8 +248,6 @@ build_train_command() {
         "--num_train_epochs" "$NUM_EPOCHS"
         "--per_device_train_batch_size" "$BATCH_SIZE"
         "--per_device_eval_batch_size" "$BATCH_SIZE"
-        "--evaluation_strategy" "steps"
-        "--save_strategy" "steps"
         "--eval_steps" "500"
         "--save_steps" "500"
         "--load_best_model_at_end" "false"
@@ -269,14 +267,14 @@ build_train_command() {
     )
 
     # Add hidden data if available
-    if [[ -d "$HIDDEN_DATA" || -f "$HIDDEN_DATA" ]]; then
+    if true; then
         args+=("--hidden_data" "$HIDDEN_DATA")
     fi
 
     # Configure distributed training
     if [[ "$NUM_GPUS" -gt 1 ]]; then
         if [[ "$USE_DEEPSPEED" == true ]]; then
-            local ds_config=$(create_deepspeed_config)
+            local ds_config=$(create_deepspeed_config | tail -n 1)
             args+=("--deepspeed" "$ds_config")
             train_cmd="torchrun --nproc_per_node=$NUM_GPUS train.py"
         else
@@ -284,7 +282,7 @@ build_train_command() {
         fi
     elif [[ "$NUM_GPUS" -eq 1 ]]; then
         if [[ "$USE_DEEPSPEED" == true ]]; then
-            local ds_config=$(create_deepspeed_config)
+            local ds_config=$(create_deepspeed_config | tail -n 1)
             args+=("--deepspeed" "$ds_config")
         fi
         train_cmd="python train.py"
